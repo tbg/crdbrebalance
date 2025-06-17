@@ -45,15 +45,35 @@ class CockroachRebalancer:
 
                 # Get replica counts per store for this specific index
                 sql = f"""
-                    WITH index_ranges AS (
-                        SELECT replicas
-                        FROM [SHOW RANGES FROM INDEX {table_name}@{index_name}]
+                    WITH
+                    table_info AS (
+                      SELECT table_id
+                      FROM crdb_internal.tables
+                      WHERE name = '{table_name}'
+                      AND state = 'PUBLIC' -- Helps with testing, where we drop the kvs table and re-create it
+                    ),
+                    index_info AS (
+                      SELECT (index_json ->> 'id')::INT AS index_id
+                      FROM (
+                        SELECT json_array_elements(
+                            crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor) -> 'table' -> 'indexes'
+                        ) AS index_json
+                        FROM system.descriptor
+                        WHERE id = (SELECT table_id FROM table_info)
+                      ) j
+                      WHERE index_json ->> 'name' = '{index_name}'
+                    ),
+                    target_ranges AS (
+                      SELECT range_id, replicas
+                      FROM crdb_internal.ranges
+                      WHERE crdb_internal.pretty_key(start_key, 0) LIKE
+                            '/' || (SELECT table_id FROM table_info)::STRING || '/' || (SELECT index_id FROM index_info)::STRING || '%'
                     )
                     SELECT
-                        store_id,
-                        count(*) AS num_replicas
-                    FROM index_ranges,
-                        unnest(replicas) AS store_id
+                      store_id,
+                      count(*) AS num_replicas
+                    FROM target_ranges,
+                         unnest(replicas) AS store_id
                     GROUP BY store_id
                     ORDER BY num_replicas DESC;
                 """
@@ -149,17 +169,34 @@ class CockroachRebalancer:
         with psycopg2.connect(self.db_url) as conn:
             with conn.cursor() as cur:
                 sql = f"""
-                    WITH ranges_with_source AS (
-                        SELECT range_id, replicas
-                        FROM [SHOW RANGES FROM INDEX {config.table_name}@{config.index_name}]
-                        WHERE %s = ANY (replicas)
-                        AND array_length(replicas, 1) > 1
+                    WITH
+                    table_info AS (
+                      SELECT table_id FROM crdb_internal.tables WHERE name = '{config.table_name}' AND state = 'PUBLIC'
+                    ),
+                    index_info AS (
+                      SELECT (index_json ->> 'id')::INT AS index_id
+                      FROM (
+                        SELECT
+                          json_array_elements(
+                            crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor) -> 'table' -> 'indexes'
+                          ) AS index_json
+                        FROM system.descriptor
+                        WHERE id = (SELECT table_id FROM table_info)
+                      ) j
+                      WHERE index_json ->> 'name' = '{config.index_name}'
+                    ),
+                    ranges_with_source AS (
+                      SELECT range_id, replicas
+                      FROM crdb_internal.ranges
+                      WHERE crdb_internal.pretty_key(start_key, 0) LIKE
+                            '/' || (SELECT table_id FROM table_info)::STRING || '/' || (SELECT index_id FROM index_info)::STRING || '%'
+                        AND {config.from_store} = ANY (replicas)
                     )
                     SELECT range_id, replicas
                     FROM ranges_with_source
-                    LIMIT %s
+                    LIMIT {config.num_replicas}
                 """
-                cur.execute(sql, (config.from_store, config.num_replicas))
+                cur.execute(sql)
                 return {row[0]: row[1] for row in cur.fetchall()}
 
     def find_best_target_store(self, existing_replicas: List[int], target_stores: List[int], store_info_map: Dict[int, StoreInfo]) -> int:
