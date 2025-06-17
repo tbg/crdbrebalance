@@ -114,7 +114,7 @@ class CockroachRebalancer:
             replica_counts: Dict mapping store_id to replica count
 
         Returns:
-            Number of replicas to move (minimum 1, maximum available on from_store)
+            Number of replicas to move (minimum 0, maximum available on from_store)
         """
         if from_store not in replica_counts:
             raise ValueError(f"from_store {from_store} not found in replica counts")
@@ -135,8 +135,8 @@ class CockroachRebalancer:
         # We want: current_from_count - num_to_move ≈ mean_replica_count
         num_to_move = current_from_count - mean_replica_count
 
-        # Ensure we don't move more than available or less than 1
-        num_to_move = max(1, min(num_to_move, current_from_count))
+        # Ensure we don't move more than available or less than 0
+        num_to_move = max(0, min(num_to_move, current_from_count))
 
         return num_to_move
 
@@ -191,6 +191,7 @@ class CockroachRebalancer:
         # Second preference: target stores that don't have this range (but might be on same node)
         range_safe_targets = [store for store in target_stores if store not in existing_replicas]
 
+        # TODO: This can just be a single error return.
         if range_safe_targets:
             # This is a configuration problem - we can avoid range conflicts but not node conflicts
             target_nodes = {store_info_map[store].node_id for store in range_safe_targets}
@@ -310,10 +311,9 @@ class CockroachRebalancer:
 
     def rebalance(self, config: RebalanceConfig) -> None:
         """Main rebalancing operation."""
-        # Get initial store distribution
-        initial_distribution = self.format_store_distribution(config.store_info_map, config.from_store, config.disallowed_stores)
 
         # Use auto-detected target stores, then filter out any manually specified disallowed stores
+        # TODO: Improve this. We don't need to recompute this stuff in rebalance.
         if config.disallowed_stores:
             # User provided manual disallowed stores - exclude them from auto-detected targets
             all_disallowed = config.disallowed_stores | {config.from_store}
@@ -340,6 +340,8 @@ class CockroachRebalancer:
         final_store_info = self.get_store_replica_counts(config.table_name, config.index_name)
         final_distribution = self.format_store_distribution(final_store_info, config.from_store)
 
+        # Print before/after comparison
+        initial_distribution = self.format_store_distribution(config.store_info_map, config.from_store, config.disallowed_stores)
         print("Before/After comparison:")
         print(f"  Before: {initial_distribution}")
         print(f"  After:  {final_distribution}")
@@ -389,11 +391,8 @@ class CockroachRebalancer:
             total_stores = len(replica_counts)
             mean_replica_count = total_replicas // total_stores
             print(f"Auto-detected num_replicas: {final_num_replicas} (target mean: {mean_replica_count})")
-        else:
-            print(f"Using num_replicas: {final_num_replicas}")
         print()
 
-        # Print what was auto-detected vs manually specified BEFORE starting work
         print(f"Rebalancing {table_name}@{index_name}:")
         print()
 
