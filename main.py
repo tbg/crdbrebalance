@@ -50,24 +50,42 @@ class CockroachRebalancer:
                       SELECT table_id
                       FROM crdb_internal.tables
                       WHERE name = '{table_name}'
-                      AND state = 'PUBLIC' -- Helps with testing, where we drop the kvs table and re-create it
+                      AND state = 'PUBLIC'
                     ),
-                    index_info AS (
-                      SELECT (index_json ->> 'id')::INT AS index_id
+                    descriptor_json AS (
+                      SELECT crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor) AS descriptor_json
+                      FROM system.descriptor
+                      WHERE id = (SELECT table_id FROM table_info)
+                    ),
+                    live_indexes AS (
+                      SELECT
+                        (json_array_elements(descriptor_json -> 'table' -> 'indexes') ->> 'id')::INT AS index_id,
+                        json_array_elements(descriptor_json -> 'table' -> 'indexes') ->> 'name' AS index_name
+                      FROM descriptor_json
+                    ),
+                    mutating_indexes AS (
+                      SELECT
+                        (m -> 'index' ->> 'id')::INT AS index_id,
+                        m -> 'index' ->> 'name' AS index_name
                       FROM (
-                        SELECT json_array_elements(
-                            crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor) -> 'table' -> 'indexes'
-                        ) AS index_json
-                        FROM system.descriptor
-                        WHERE id = (SELECT table_id FROM table_info)
-                      ) j
-                      WHERE index_json ->> 'name' = '{index_name}'
+                        SELECT json_array_elements(descriptor_json -> 'table' -> 'mutations') AS m
+                        FROM descriptor_json
+                      ) AS sub
+                      WHERE m ? 'index'
+                    ),
+                    target_index AS (
+                      SELECT index_id FROM (
+                        SELECT * FROM live_indexes
+                        UNION ALL
+                        SELECT * FROM mutating_indexes
+                      ) AS all_indexes
+                      WHERE index_name = '{index_name}'
                     ),
                     target_ranges AS (
                       SELECT range_id, replicas
                       FROM crdb_internal.ranges
                       WHERE crdb_internal.pretty_key(start_key, 0) LIKE
-                            '/' || (SELECT table_id FROM table_info)::STRING || '/' || (SELECT index_id FROM index_info)::STRING || '%'
+                            '/' || (SELECT table_id FROM table_info)::STRING || '/' || (SELECT index_id FROM target_index)::STRING || '%'
                     )
                     SELECT
                       store_id,
@@ -173,27 +191,44 @@ class CockroachRebalancer:
                     table_info AS (
                       SELECT table_id FROM crdb_internal.tables WHERE name = '{config.table_name}' AND state = 'PUBLIC'
                     ),
-                    index_info AS (
-                      SELECT (index_json ->> 'id')::INT AS index_id
-                      FROM (
-                        SELECT
-                          json_array_elements(
-                            crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor) -> 'table' -> 'indexes'
-                          ) AS index_json
-                        FROM system.descriptor
-                        WHERE id = (SELECT table_id FROM table_info)
-                      ) j
-                      WHERE index_json ->> 'name' = '{config.index_name}'
+                    descriptor_json AS (
+                      SELECT crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor) AS descriptor_json
+                      FROM system.descriptor
+                      WHERE id = (SELECT table_id FROM table_info)
                     ),
-                    ranges_with_source AS (
+                    live_indexes AS (
+                      SELECT
+                        (json_array_elements(descriptor_json -> 'table' -> 'indexes') ->> 'id')::INT AS index_id,
+                        json_array_elements(descriptor_json -> 'table' -> 'indexes') ->> 'name' AS index_name
+                      FROM descriptor_json
+                    ),
+                    mutating_indexes AS (
+                      SELECT
+                        (m -> 'index' ->> 'id')::INT AS index_id,
+                        m -> 'index' ->> 'name' AS index_name
+                      FROM (
+                        SELECT json_array_elements(descriptor_json -> 'table' -> 'mutations') AS m
+                        FROM descriptor_json
+                      ) AS sub
+                      WHERE m ? 'index'
+                    ),
+                    target_index AS (
+                      SELECT index_id FROM (
+                        SELECT * FROM live_indexes
+                        UNION ALL
+                        SELECT * FROM mutating_indexes
+                      ) AS all_indexes
+                      WHERE index_name = '{config.index_name}'
+                    ),
+                    target_ranges AS (
                       SELECT range_id, replicas
                       FROM crdb_internal.ranges
                       WHERE crdb_internal.pretty_key(start_key, 0) LIKE
-                            '/' || (SELECT table_id FROM table_info)::STRING || '/' || (SELECT index_id FROM index_info)::STRING || '%'
+                            '/' || (SELECT table_id FROM table_info)::STRING || '/' || (SELECT index_id FROM target_index)::STRING || '%'
                         AND {config.from_store} = ANY (replicas)
                     )
                     SELECT range_id, replicas
-                    FROM ranges_with_source
+                    FROM target_ranges
                     LIMIT {config.num_replicas}
                 """
                 cur.execute(sql)
